@@ -19,26 +19,55 @@ import re
 import traceback
 import requests
 from urllib.parse import urlparse
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+from werkzeug.exceptions import NotFound
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+app.config["APPLICATION_ROOT"] = "/sar-service"
+app.config['PREFERRED_URL_SCHEME'] = 'https'  # URL 생성 시 HTTPS 사용
+app.config['SESSION_COOKIE_SECURE'] = True  # 이미 있음
+app.config['SESSION_COOKIE_HTTPONLY'] = True  # 이미 있음
+app.config['SESSION_COOKIE_PATH'] = '/sar-service'  # 쿠키 경로 설정
 
 # 로깅 설정
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(
-    handlers=[
-        RotatingFileHandler(
-            LOG_DIR / 'app.log',
-            maxBytes=10485760,  # 10MB
-            backupCount=5
-        )
-    ],
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+# 콘솔 핸들러 추가
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+
+# 파일 핸들러 설정
+file_handler = RotatingFileHandler(
+    LOG_DIR / 'app.log',
+    maxBytes=10485760,  # 10MB
+    backupCount=5
 )
+file_handler.setLevel(logging.DEBUG)
+
+# 더 상세한 로그 포맷 설정
+log_format = logging.Formatter(
+    '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - '
+    'ProcessID:%(process)d - ThreadID:%(thread)d - '
+    '%(funcName)s - %(message)s'
+)
+
+console_handler.setFormatter(log_format)
+file_handler.setFormatter(log_format)
+
+# 루트 로거 설정
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)  # 전체 로깅 레벨 DEBUG로 설정
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+
+# 특정 모듈의 로그 레벨 조정 (선택적)
+logging.getLogger('werkzeug').setLevel(logging.INFO)
+logging.getLogger('urllib3').setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
+logger.info("로깅 시스템이 초기화되었습니다.")
 
 # 업로드 디렉토리 설정
 UPLOAD_ROOT = Path('uploads')
@@ -50,8 +79,6 @@ processing_lock = threading.Lock()
 
 # 앱 설정 추가
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)  # 세션 유효 기간
-app.config['SESSION_COOKIE_SECURE'] = True  # HTTPS만 사용
-app.config['SESSION_COOKIE_HTTPONLY'] = True  # JavaScript에서 접근 불가
 
 def cleanup_old_files():
     """24시간 이상 된 파일 및 빈 디렉토리 정리"""
@@ -132,57 +159,63 @@ def upload_file():
 @app.route('/process-url', methods=['POST'])
 def process_url():
     try:
-        url = request.form.get('url')
-        if not url:
+        file_url = request.form.get('file_url')
+        if not file_url:
             return jsonify({'error': 'URL이 제공되지 않았습니다.'}), 400
 
-        # 시간 필터 정보 가져오기
         time_filter_enabled = request.form.get('timeFilterEnabled') == 'true'
         start_time = request.form.get('startTime', '')
         end_time = request.form.get('endTime', '')
 
-        logger.info("=== URL Processing Request ===")
-        logger.info(f"URL: {url}")
-        logger.info(f"Time filter enabled: {time_filter_enabled}")
-        logger.info(f"Start time: {start_time}")
-        logger.info(f"End time: {end_time}")
+        # 세션 ID 확인 및 생성
+        session_id = session.get('session_id')
+        if not session_id:
+            session_id = str(uuid.uuid4())
+            session['session_id'] = session_id
 
-        # 세션 ID 생성
-        session_id = str(uuid.uuid4())
-        session['session_id'] = session_id
+        # URL에서 파일명 추출
+        parsed_url = urlparse(file_url)
+        filename = os.path.basename(parsed_url.path)
+        if not filename:
+            filename = f"downloaded_sar_{int(time.time())}"
 
-        # 파일 저장 디렉토리 생성
+        # 세션 디렉토리 생성
         session_dir = UPLOAD_ROOT / session_id
         session_dir.mkdir(exist_ok=True)
+        file_path = session_dir / secure_filename(filename)
 
         # URL에서 파일 다운로드
-        response = requests.get(url, stream=True)
-        if response.status_code != 200:
-            return jsonify({'error': 'URL에서 파일을 다운로드할 수 없습니다.'}), 400
+        response = requests.get(file_url, stream=True)
+        response.raise_for_status()
 
         # 파일 저장
-        file_path = session_dir / 'downloaded_file'
         with open(file_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
 
-        # 시간 필터 정보를 포함하여 데이터 처리
-        result = process_sar_data(str(file_path), time_filter_enabled, start_time, end_time)
+        # 파일 처리 시작
+        if not is_sar_binary(str(file_path)):
+            raise Exception("올바른 SAR 바이너리 파일이 아닙니다.")
 
-        # 임시 파일 삭제
-        try:
-            os.remove(file_path)
-            session_dir.rmdir()
-        except Exception as e:
-            logger.error(f"Error removing temporary files: {str(e)}")
+        processing_thread = threading.Thread(
+            target=process_sar_data_async,
+            args=(str(file_path), session_id, time_filter_enabled, start_time, end_time)
+        )
+        processing_thread.daemon = True
+        processing_thread.start()
 
-        return jsonify(result)
+        with processing_lock:
+            processing_status[session_id] = {'status': 'processing'}
 
+        return jsonify({'session_id': session_id, 'status': 'processing'})
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"URL 다운로드 오류: {str(e)}")
+        return jsonify({'error': f'파일 다운로드 실패: {str(e)}'}), 500
     except Exception as e:
-        logger.error(f"URL processing error: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({'error': f'URL 처리 중 오류가 발생했습니다: {str(e)}'}), 500
+        logger.error(f"URL 처리 오류: {str(e)}")
+        return jsonify({'error': f'URL 처리 중 오류 발생: {str(e)}'}), 500
 
 def is_sar_binary(file_path):
     """SA 바이너리 파일 여부 확인"""
@@ -247,20 +280,43 @@ def process_sar_data_async(file_path, session_id, time_filter_enabled=False, sta
         except Exception as e:
             logger.error(f"Error removing temporary file: {str(e)}")
 
-@app.route('/status/<session_id>', methods=['GET'])
+@app.route('/status/<session_id>')
 def check_status(session_id):
     try:
+        logger.info(f"Checking status for session: {session_id}")
+
         with processing_lock:
-            status_info = processing_status.get(session_id, {})
+            status_info = processing_status.get(session_id)
 
         if not status_info:
-            return jsonify({'error': '세션을 찾을 수 없습니다.'}), 404
+            logger.error(f"No status found for session: {session_id}")
+            return jsonify({'status': 'error', 'error': 'Session not found'}), 404
+
+        logger.debug(f"Status info: {json.dumps(status_info, default=str)}")
+
+        # 결과 데이터가 있는 경우 timestamp 확인
+        if status_info.get('status') == 'completed' and 'result' in status_info:
+            result = status_info['result']
+            if not result or not isinstance(result, dict):
+                logger.error(f"Invalid result data structure: {result}")
+                return jsonify({'status': 'error', 'error': 'Invalid result data'}), 500
+
+            # 기본 데이터 구조 확인
+            required_fields = ['cpu', 'memory', 'network', 'disk', 'load']
+            for field in required_fields:
+                if field not in result:
+                    logger.error(f"Missing required field: {field}")
+                    return jsonify({'status': 'error', 'error': f'Missing {field} data'}), 500
 
         return jsonify(status_info)
 
     except Exception as e:
-        logger.error(f"Status check error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error checking status: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'status': 'error',
+            'error': f'Status check failed: {str(e)}'
+        }), 500
 
 # 파일 정리 스케줄러 시작
 def start_cleanup_scheduler():
@@ -307,6 +363,10 @@ def get_kernel_version(file_path):
 
 def get_sadf_command(kernel_version):
     """커널 버전에 따른 sadf 명령어 경로 반환"""
+    import os
+    import subprocess
+    import logging
+
     if kernel_version == '9.x':
         sadf_path = '/opt/gwsar/bin/sadf9'
     elif kernel_version == '8.x':
@@ -316,10 +376,38 @@ def get_sadf_command(kernel_version):
     else:
         raise Exception("Unsupported kernel version")
 
-    if not os.path.exists(sadf_path):
-        raise Exception(f"sadf command not found: {sadf_path}")
+    # 파일 존재 확인 및 상세 로깅
+    logger.info(f"Checking sadf path for kernel {kernel_version}: {sadf_path}")
+    if os.path.exists(sadf_path):
+        logger.info(f"File exists: {sadf_path}")
+        logger.info(f"File size: {os.path.getsize(sadf_path)} bytes")
+        logger.info(f"File permissions: {oct(os.stat(sadf_path).st_mode)}")
 
-    return sadf_path
+        # 공유 라이브러리 의존성 확인
+        try:
+            ldd_output = subprocess.run(['ldd', sadf_path], capture_output=True, text=True)
+            logger.info(f"Shared library dependencies:\n{ldd_output.stdout}")
+        except Exception as e:
+            logger.warning(f"Failed to check library dependencies: {str(e)}")
+
+        # 파일 실행 테스트
+        try:
+            test_output = subprocess.run([sadf_path, '-V'], capture_output=True, text=True)
+            logger.info(f"Test execution output:\n{test_output.stdout}")
+        except Exception as e:
+            logger.error(f"Test execution failed: {str(e)}")
+
+        return sadf_path
+    else:
+        logger.error(f"sadf command not found: {sadf_path}")
+
+        # 대체 경로 시도
+        system_sadf = '/usr/bin/sadf'
+        if os.path.exists(system_sadf):
+            logger.info(f"Using system sadf instead: {system_sadf}")
+            return system_sadf
+
+        raise Exception(f"sadf command not found: {sadf_path}")
 
 def process_disk_metrics(disk, kernel_version):
     """커널 버전별 디스크 메트릭 계산"""
@@ -455,6 +543,7 @@ def get_sar_metadata(file_path, env):
                     if field in host_info:
                         cpu_count = host_info[field]
                         break
+
                 metadata = {
                     'hostname': hostname,
                     'date': sar_date,
@@ -498,9 +587,9 @@ def process_sar_data(file_path, time_filter_enabled=False, start_time='', end_ti
         env = os.environ.copy()
         env['LANG'] = 'C'
 
-        # 메타데이터 추출
+        # 메타데이터 추출 (SAR 명령어 출력 사용)
         metadata = get_sar_metadata(file_path, env)
-        logger.info(f"Extracted metadata: {metadata}")
+        logger.info(f"SAR file metadata: {metadata}")
 
         # 커널 버전 확인
         kernel_version, os_type = get_kernel_version(file_path)
@@ -512,15 +601,13 @@ def process_sar_data(file_path, time_filter_enabled=False, start_time='', end_ti
 
         # 기본 명령어 구성
         base_cmd = [sadf_cmd, '-j', str(file_path), '--']
-
-        # 시간 필터가 활성화된 경우에만 시간 범위 추가
         if time_filter_enabled and start_time and end_time:
             logger.info(f"Applying time filter: {start_time} - {end_time}")
             base_cmd.extend(['-s', start_time, '-e', end_time])
 
         logger.info(f"Final command: {' '.join(base_cmd)}")
 
-        # 각 메트릭 수집
+        # 각 메트릭 수집 (버전별 명령어 구성)
         metrics = {
             'cpu': base_cmd + ['-u', 'ALL'],
             'memory': base_cmd + ['-r'],
@@ -644,13 +731,6 @@ def process_sar_data(file_path, time_filter_enabled=False, start_time='', end_ti
         # 결과 데이터에 메타데이터 추가
         data['metadata'] = metadata
 
-        # 메타데이터가 포함된 것을 확인하기 위한 로깅
-        logger.info("Final data structure includes metadata:")
-        logger.info(f"- Hostname: {metadata.get('hostname', 'N/A')}")
-        logger.info(f"- Date: {metadata.get('date', 'N/A')}")
-        logger.info(f"- OS Version: {metadata.get('os_version', 'N/A')}")
-        logger.info(f"- Kernel Version: {metadata.get('kernel_version', 'N/A')}")
-
         return data
 
     except Exception as e:
@@ -664,6 +744,21 @@ def signal_handler(sig, frame):
     cleanup_old_files()  # 종료 전 파일 정리
     sys.exit(0)
 
+# 더 강력한 보안 헤더 추가
+@app.after_request
+def add_security_headers(response):
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    return response
+
+# WSGI 미들웨어를 사용하여 /sar-service 접두사 추가
+application = DispatcherMiddleware(NotFound(), {
+    '/sar-service': app
+})
+
+# WSGI 서버가 application을 사용하도록 설정
 if __name__ == '__main__':
     # Ctrl+C 핸들러 등록
     signal.signal(signal.SIGINT, signal_handler)
@@ -676,10 +771,9 @@ if __name__ == '__main__':
     # 서버 시작
     logger.info('Server starting on http://0.0.0.0:5000')
     try:
-        http_server = WSGIServer(('0.0.0.0', 5000), app)
-        http_server.serve_forever()
+        from werkzeug.serving import run_simple
+        run_simple('0.0.0.0', 5000, application, use_reloader=True)
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")
         cleanup_old_files()
         sys.exit(0)
-                                                  
